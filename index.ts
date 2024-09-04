@@ -2,13 +2,15 @@ import path from 'path'
 import fs from 'fs-extra'
 import process from 'process'
 import { execa } from 'execa'
+import semver from 'semver'
+import _ from 'lodash'
 
 type CommonNpmTags = 'latest' | 'next' | 'canary'
-type Version = [number, number, number]
 
 const cwd = process.cwd()
 const packagePath = path.resolve(cwd, 'package.json')
 const packageName = '@docusaurus/core'
+
 type Package = {
   name: string
   version: string
@@ -68,11 +70,8 @@ function verifyPackageName(packageNames: string[]) {
   }
 }
 
-function suggestVersion(currentVersion: string, versions: string[]): string {
-  // Helper function to parse version string into an array of numbers
-  const parseVersion = (version: string): (number | string)[] => version.split(/[\.\-]/).map((part) => (isNaN(Number(part)) ? part : Number(part)))
-
-  // Helper function to categorize versions
+export function suggestVersion(currentVersion: string, versions: string[]): string {
+  // Categorize versions
   const categorizeVersion = (version: string) => {
     if (version.startsWith('0.0.0-')) return 'canary'
     if (version.includes('alpha')) return 'alpha'
@@ -81,35 +80,45 @@ function suggestVersion(currentVersion: string, versions: string[]): string {
     return 'stable'
   }
 
-  // Get the category of the current version
   const currentCategory = categorizeVersion(currentVersion)
 
-  // Sort versions in descending order based on version numbers
-  const sortedVersions = versions.sort((a, b) => {
-    const parsedA = parseVersion(a)
-    const parsedB = parseVersion(b)
+  const versionsByCategory = _.groupBy(versions, categorizeVersion)
 
-    for (let i = 0; i < Math.max(parsedA.length, parsedB.length); i++) {
-      if (parsedA[i] === undefined) return -1
-      if (parsedB[i] === undefined) return 1
-      if (parsedA[i] < parsedB[i]) return 1
-      if (parsedA[i] > parsedB[i]) return -1
-    }
-    return 0
-  })
+  const sortedVersions = _.mapValues(versionsByCategory, (versionGroup) => versionGroup.sort(semver.rcompare))
 
-  // Filter versions by category
-  const versionsInCategory = sortedVersions.filter((v) => categorizeVersion(v) === currentCategory)
-  const latestInCategory = versionsInCategory[0]
-
-  if (latestInCategory === currentVersion) {
-    // Suggest the latest stable version if current is the latest in its category
-    const latestStable = sortedVersions.find((v) => categorizeVersion(v) === 'stable')
-    return latestStable || 'No higher stable version available'
-  } else {
-    // Suggest the latest version in the current category
-    return latestInCategory || 'No suitable version found'
+  if (currentCategory === 'canary') {
+    const latestCanary = _.first(sortedVersions.canary)
+    return latestCanary === currentVersion ? 'No higher canary version available' : latestCanary!
   }
+
+  if (currentCategory !== 'stable') {
+    const nextStableInSameMinor = _.find(sortedVersions.stable, (v) => semver.satisfies(v, `${semver.major(currentVersion)}.${semver.minor(currentVersion)}`))
+    if (nextStableInSameMinor) {
+      return nextStableInSameMinor
+    }
+  }
+
+  if (currentCategory === 'stable') {
+    const nextStable = _.find(sortedVersions.stable, (v) => semver.gt(v, currentVersion) && semver.satisfies(v, `${semver.major(currentVersion)}`))
+
+    if (nextStable) {
+      return nextStable
+    }
+  }
+
+  // Handle next major version upgrade
+  const nextMajorStable = _.find(sortedVersions.stable, (v) => semver.major(v) > semver.major(currentVersion))
+
+  if (nextMajorStable) {
+    return nextMajorStable
+  }
+
+  const latestStable = _.first(sortedVersions.stable)
+  if (currentCategory === 'stable' && currentVersion === latestStable) {
+    return 'No higher stable version available'
+  }
+
+  return 'No suitable version found'
 }
 
 export async function upgrade(siteDir: string, { userRequestTag }: { userRequestTag: CommonNpmTags }): Promise<void> {
@@ -125,19 +134,17 @@ export async function upgrade(siteDir: string, { userRequestTag }: { userRequest
 
   const packageNames = (await getPackageList('@docusaurus')) as unknown as Packages
   verifyPackageName(packageNames.map(({ name }) => name))
-  const currentDocusaurusVersion = packageNames.find(({ name }) => name === packageName)!.version.match(/\d+\.\d+\.\d+/g)![0]
-  console.log('currentDocusaurusVersion:', currentDocusaurusVersion)
+  const currentDocusaurusVersion = semver.coerce(packageNames.find(({ name }) => name === packageName)!.version)?.raw || '0'
   const suggestedVersion = suggestVersion(currentDocusaurusVersion, versions)
-  console.log('suggestedVersion:', suggestedVersion)
 
-  const packageNamesWithTag = packageNames.map((name) => [name, userRequestTag] as const)
-  console.log(`Upgrading ${packageNames.length} package(s) ${packageNames} code=${`${commandClient} ${packageNames.join(' ')}`}`)
+  // const packageNamesWithTag = packageNames.map((name) => [name, userRequestTag] as const)
+  // console.log(`Upgrading ${packageNames.length} package(s) ${packageNames} code=${`${commandClient} ${packageNames.join(' ')}`}`)
 
-  packageNamesWithTag.forEach(([name, tag]) => {
-    const version = tags[tag]
-    console.log(`Upgrading ${name} to ${version}`)
-    execa(commandClient, [`${name}@${version}`], { cwd: siteDir, stdio: 'inherit' })
-  })
+  // packageNamesWithTag.forEach(([name, tag]) => {
+  //   const version = tags[tag]
+  //   console.log(`Upgrading ${name} to ${version}`)
+  //   // execa(commandClient, [`${name}@${version}`], { cwd: siteDir, stdio: 'inherit' })
+  // })
 }
 
 upgrade(cwd, { userRequestTag: 'latest' })

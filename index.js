@@ -2,6 +2,8 @@ import path from 'path';
 import fs from 'fs-extra';
 import process from 'process';
 import { execa } from 'execa';
+import semver from 'semver';
+import _ from 'lodash';
 const cwd = process.cwd();
 const packagePath = path.resolve(cwd, 'package.json');
 const packageName = '@docusaurus/core';
@@ -51,10 +53,8 @@ function verifyPackageName(packageNames) {
         throw new Error(`Found 0 packages with scope @docusaurus`);
     }
 }
-function suggestVersion(currentVersion, versions) {
-    // Helper function to parse version string into an array of numbers
-    const parseVersion = (version) => version.split(/[\.\-]/).map((part) => (isNaN(Number(part)) ? part : Number(part)));
-    // Helper function to categorize versions
+export function suggestVersion(currentVersion, versions) {
+    // Categorize versions
     const categorizeVersion = (version) => {
         if (version.startsWith('0.0.0-'))
             return 'canary';
@@ -66,36 +66,39 @@ function suggestVersion(currentVersion, versions) {
             return 'rc';
         return 'stable';
     };
-    // Get the category of the current version
     const currentCategory = categorizeVersion(currentVersion);
-    // Sort versions in descending order based on version numbers
-    const sortedVersions = versions.sort((a, b) => {
-        const parsedA = parseVersion(a);
-        const parsedB = parseVersion(b);
-        for (let i = 0; i < Math.max(parsedA.length, parsedB.length); i++) {
-            if (parsedA[i] === undefined)
-                return -1;
-            if (parsedB[i] === undefined)
-                return 1;
-            if (parsedA[i] < parsedB[i])
-                return 1;
-            if (parsedA[i] > parsedB[i])
-                return -1;
+    const versionsByCategory = _.groupBy(versions, categorizeVersion);
+    const sortedVersions = _.mapValues(versionsByCategory, (versionGroup) => versionGroup.sort(semver.rcompare));
+    // Handle canary versions
+    if (currentCategory === 'canary') {
+        const latestCanary = _.first(sortedVersions.canary);
+        return latestCanary === currentVersion ? 'No higher canary version available' : latestCanary;
+    }
+    // Handle stable versions and transitions from alpha/beta/rc to stable
+    if (currentCategory !== 'stable') {
+        const nextStableInSameMinor = _.find(sortedVersions.stable, (v) => semver.satisfies(v, `${semver.major(currentVersion)}.${semver.minor(currentVersion)}`));
+        if (nextStableInSameMinor) {
+            return nextStableInSameMinor;
         }
-        return 0;
-    });
-    // Filter versions by category
-    const versionsInCategory = sortedVersions.filter((v) => categorizeVersion(v) === currentCategory);
-    const latestInCategory = versionsInCategory[0];
-    if (latestInCategory === currentVersion) {
-        // Suggest the latest stable version if current is the latest in its category
-        const latestStable = sortedVersions.find((v) => categorizeVersion(v) === 'stable');
-        return latestStable || 'No higher stable version available';
     }
-    else {
-        // Suggest the latest version in the current category
-        return latestInCategory || 'No suitable version found';
+    // Handle next stable version within the same major version
+    if (currentCategory === 'stable') {
+        const nextStable = _.find(sortedVersions.stable, (v) => semver.gt(v, currentVersion) && semver.satisfies(v, `${semver.major(currentVersion)}`));
+        if (nextStable) {
+            return nextStable;
+        }
     }
+    // Handle next major version upgrade
+    const nextMajorStable = _.find(sortedVersions.stable, (v) => semver.major(v) > semver.major(currentVersion));
+    if (nextMajorStable) {
+        return nextMajorStable;
+    }
+    // If already on the latest stable version
+    const latestStable = _.first(sortedVersions.stable);
+    if (currentCategory === 'stable' && currentVersion === latestStable) {
+        return 'No higher stable version available';
+    }
+    return 'No suitable version found';
 }
 export async function upgrade(siteDir, { userRequestTag }) {
     if (!fs.existsSync(packagePath)) {
@@ -107,16 +110,14 @@ export async function upgrade(siteDir, { userRequestTag }) {
     verifyRequestedTag(userRequestTag, tags);
     const packageNames = (await getPackageList('@docusaurus'));
     verifyPackageName(packageNames.map(({ name }) => name));
-    const currentDocusaurusVersion = packageNames.find(({ name }) => name === packageName).version.match(/\d+\.\d+\.\d+/g)[0];
-    console.log('currentDocusaurusVersion:', currentDocusaurusVersion);
+    const currentDocusaurusVersion = semver.coerce(packageNames.find(({ name }) => name === packageName).version)?.raw || '0';
     const suggestedVersion = suggestVersion(currentDocusaurusVersion, versions);
-    console.log('suggestedVersion:', suggestedVersion);
-    const packageNamesWithTag = packageNames.map((name) => [name, userRequestTag]);
-    console.log(`Upgrading ${packageNames.length} package(s) ${packageNames} code=${`${commandClient} ${packageNames.join(' ')}`}`);
-    packageNamesWithTag.forEach(([name, tag]) => {
-        const version = tags[tag];
-        console.log(`Upgrading ${name} to ${version}`);
-        execa(commandClient, [`${name}@${version}`], { cwd: siteDir, stdio: 'inherit' });
-    });
+    // const packageNamesWithTag = packageNames.map((name) => [name, userRequestTag] as const)
+    // console.log(`Upgrading ${packageNames.length} package(s) ${packageNames} code=${`${commandClient} ${packageNames.join(' ')}`}`)
+    // packageNamesWithTag.forEach(([name, tag]) => {
+    //   const version = tags[tag]
+    //   console.log(`Upgrading ${name} to ${version}`)
+    //   // execa(commandClient, [`${name}@${version}`], { cwd: siteDir, stdio: 'inherit' })
+    // })
 }
 upgrade(cwd, { userRequestTag: 'latest' });
